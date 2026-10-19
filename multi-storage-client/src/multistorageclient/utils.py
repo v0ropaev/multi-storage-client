@@ -22,19 +22,50 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from lark import Lark, Transformer
 from wcmatch import glob as wcmatch_glob
 
-from .types import ExecutionMode, ObjectMetadata, PatternList, PatternType
+from .types import ExecutionMode, ObjectMetadata, PatternList, PatternType, TransferCallback, TransferEvent
 
 if TYPE_CHECKING:
     from .client.types import AbstractStorageClient
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _transfer_notification(transfer_callback: TransferCallback | None, index: int) -> Iterator[None]:
+    """Notify an observer without letting callback exceptions change transfer results."""
+
+    def notify(event: TransferEvent) -> None:
+        if transfer_callback is not None:
+            try:
+                transfer_callback(index, event)
+            except Exception:
+                logger.warning("Transfer callback failed for index %d (%s)", index, event, exc_info=True)
+
+    notify("started")
+    try:
+        yield
+    except BaseException:
+        notify("failed")
+        raise
+    else:
+        notify("completed")
+
+
+def _map_transfer_callback(
+    transfer_callback: TransferCallback | None, indices: Sequence[int]
+) -> TransferCallback | None:
+    """Preserve caller indices when transfers are regrouped or retried."""
+    if transfer_callback is None:
+        return None
+    return lambda index, event: transfer_callback(indices[index], event)
 
 
 def safe_makedirs(path: str, mode: int = 0o777, exist_ok: bool = True) -> None:

@@ -74,7 +74,10 @@ class ResultMonitorThread(threading.Thread):
                 if op == OperationType.STOP:
                     break
 
-                if op == OperationType.ADD:
+                if op == OperationType.PROGRESS:
+                    self.progress.update_transfers(target_file_path, physical_metadata)
+                    self.progress.refresh()
+                elif op == OperationType.ADD:
                     # ADD messages arrive from QueueBackedMetadataProvider (when metadata
                     # provider is configured) or from the worker directly.
                     # Replay add_file on the REAL metadata provider via the saved direct reference,

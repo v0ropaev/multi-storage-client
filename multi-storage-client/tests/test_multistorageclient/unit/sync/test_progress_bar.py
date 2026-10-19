@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+import os
 import threading
 import time
 from contextlib import nullcontext
@@ -23,6 +25,158 @@ import pytest
 
 from multistorageclient.sync import progress_bar as progress_bar_module
 from multistorageclient.sync.progress_bar import ProgressBar
+from multistorageclient.sync.transfer_progress import TransferActivity, TransferSnapshot
+
+
+@pytest.mark.parametrize("include_deletions", [False, True])
+@pytest.mark.parametrize(
+    "operation, completed_label, active_label",
+    [
+        ("download", "downloaded", "downloading"),
+        ("upload", "uploaded", "uploading"),
+        ("copy", "copied", "copying"),
+        ("transfer", "transferred", "transferring"),
+    ],
+)
+def test_inflight_display_keeps_network_rate_and_finalizes_after_metadata(
+    monkeypatch, include_deletions, operation, completed_label, active_label
+):
+    completed_label = "completed" if include_deletions else completed_label
+    output = io.StringIO()
+    monkeypatch.setattr(output, "isatty", lambda: True)
+    monkeypatch.setattr(progress_bar_module.sys, "stderr", output)
+    monkeypatch.setattr(progress_bar_module.shutil, "get_terminal_size", lambda **kwargs: os.terminal_size((120, 24)))
+    clock = mock.Mock(return_value=100.0)
+    monkeypatch.setattr(progress_bar_module, "time", SimpleNamespace(time=clock, monotonic=clock))
+    monitor = mock.Mock(rate=25_000_000.0, error=None)
+    monkeypatch.setattr(progress_bar_module, "NetworkThroughputMonitor", mock.Mock(return_value=monitor))
+    with (
+        ProgressBar(
+            "Syncing dataset alpha",
+            True,
+            total_items=1000,
+            show_network_throughput=True,
+            show_transfer_progress=True,
+            transfer_operation=operation,
+            include_deletions=include_deletions,
+        ) as progress,
+        progress.network_throughput({123}),
+    ):
+        assert progress.pbar is not None
+        progress.set_phase(None)
+        progress.update_transfers(
+            "worker-a",
+            TransferSnapshot(
+                24,
+                (
+                    TransferActivity("first.tar", 10.0),
+                    TransferActivity("third.tar", 30.0),
+                    TransferActivity("fourth.tar", 40.0),
+                    TransferActivity("fifth.tar", 50.0),
+                    TransferActivity("sixth.tar", 60.0),
+                ),
+            ),
+        )
+        progress.update_transfers("worker-b", TransferSnapshot(100, (TransferActivity("second.tar", 20.0),)))
+        progress.update_progress(420)
+        clock.return_value += 1.0
+        progress.refresh()
+        assert str(progress.pbar).startswith("Syncing dataset alpha  [")
+        assert "Downloading" not in output.getvalue()
+        assert "42%" in str(progress.pbar)
+        assert progress._summary_row is not None
+        assert f"420/1000 files {completed_label}" in progress._summary_row.desc
+        assert "25.0 MB/s" in progress._summary_row.desc
+        assert "network" not in progress._summary_row.desc
+        assert "net:" not in progress._summary_row.desc
+        assert f"124 {active_label}" in progress._summary_row.desc
+        assert "elapsed" in progress._summary_row.desc
+        assert len(progress._detail_rows) == 8
+        assert progress._detail_rows[0].desc == ""
+        assert f"Currently {active_label}" in progress._detail_rows[1].desc
+        assert progress._detail_rows[1].desc.endswith("Elapsed")
+        assert "first.tar" in progress._detail_rows[2].desc
+        assert "second.tar" in progress._detail_rows[3].desc
+        assert "third.tar" in progress._detail_rows[4].desc
+        assert "fourth.tar" in progress._detail_rows[5].desc
+        assert "fifth.tar" in progress._detail_rows[6].desc
+        assert f"+ 119 more {active_label}" in progress._detail_rows[7].desc
+        assert progress._detail_rows[2].desc.endswith("01:31")
+        assert len({progress_bar_module.disp_len(row.desc) for row in progress._detail_rows[1:7]}) == 1
+
+        monitor.error = OSError("sampler failed")
+        progress.update_transfers("worker-a", TransferSnapshot(0, ()))
+        progress.update_transfers("worker-b", TransferSnapshot(0, ()))
+        clock.return_value += 1.0
+        progress.refresh()
+        assert "network unavailable" in progress._summary_row.desc
+        assert f"0 {active_label}" in progress._summary_row.desc
+        assert all(row.desc == "" for row in progress._detail_rows)
+        progress.update_progress(580)
+        progress.set_phase("finalizing metadata")
+        assert "99.9%" in str(progress.pbar)
+        assert "finalizing metadata" in progress._summary_row.desc
+        progress.close(complete=True)
+        assert "100%" in str(progress.pbar)
+        assert f"1000/1000 files {completed_label}" in output.getvalue().splitlines()[-1]
+        assert "finalizing metadata" not in output.getvalue().splitlines()[-1]
+        assert progress._summary_row is None
+        assert progress._detail_rows == []
+    monitor.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "tty, suppress, show_transfers", [(False, False, True), (True, True, True), (True, False, False)]
+)
+def test_file_details_are_disabled_when_inapplicable(monkeypatch, tty, suppress, show_transfers):
+    output = io.StringIO()
+    monkeypatch.setattr(output, "isatty", lambda: tty)
+    monkeypatch.setattr(progress_bar_module.sys, "stderr", output)
+    if suppress:
+        monkeypatch.setenv("MSC_SUPPRESS_PROGRESS_BAR", "1")
+    with ProgressBar("Syncing", True, show_transfer_progress=show_transfers) as progress:
+        progress.update_transfers("worker", TransferSnapshot(1, (TransferActivity("file.tar", 0.0),)))
+        progress.refresh()
+        assert progress._detail_rows == []
+        assert progress._summary_row is None
+        assert (progress.pbar is None) == suppress
+    assert "\x1b[A" not in output.getvalue()
+
+
+@pytest.mark.parametrize("width", [32, 80, 160])
+def test_file_details_fit_terminal_width_and_escape_control_characters(monkeypatch, width):
+    output = io.StringIO()
+    monkeypatch.setattr(output, "isatty", lambda: True)
+    monkeypatch.setattr(progress_bar_module.sys, "stderr", output)
+    monkeypatch.setattr(progress_bar_module.shutil, "get_terminal_size", lambda **kwargs: os.terminal_size((width, 24)))
+    path = "nested/" * 20 + "数据\n\x1b.tar"
+    with ProgressBar("Syncing", True, total_items=100, show_transfer_progress=True) as progress:
+        assert progress.pbar is not None
+        progress.pbar.dynamic_ncols = False
+        progress.pbar.ncols = width
+        progress.update_transfers("worker", TransferSnapshot(1, (TransferActivity(path, 0.0),)))
+        progress.refresh()
+        meter = str(progress.pbar)
+        bar = meter.split("[", 1)[1].split("]", 1)[0]
+        assert progress_bar_module.disp_len(bar) <= 20
+        assert progress_bar_module.disp_len(meter) <= width
+        if width >= 80:
+            assert progress_bar_module.disp_len(bar) == 20
+            assert progress_bar_module.disp_len(meter) < width
+        progress.update_progress(100)
+        assert "99.9%" in str(progress.pbar)
+        assert progress_bar_module.disp_len(str(progress.pbar)) <= width
+        row = progress._detail_rows[2]
+        assert "\n" not in row.desc
+        assert "\x1b" not in row.desc
+        assert progress_bar_module.disp_len(row.desc) < width
+        assert progress_bar_module.disp_len(row.desc) == min(60, width - 1)
+        assert ".tar" in row.desc
+        assert all(progress_bar_module.disp_len(item.desc) <= min(60, width - 1) for item in progress._detail_rows)
+        assert progress_bar_module.disp_len(progress._detail_rows[1].desc) == progress_bar_module.disp_len(row.desc)
+        assert progress._detail_rows[1].desc.endswith("Elapsed")
+        assert progress._summary_row is not None
+        assert progress_bar_module.disp_len(progress._summary_row.desc) < width
 
 
 def test_progress_bar_capped_percentage():
@@ -31,6 +185,18 @@ def test_progress_bar_capped_percentage():
     progress.update_total(100_000)
     progress.update_progress(99_999)
     assert "99.9%" in str(progress.pbar)
+    for width in [32, 80, 100]:
+        meter = progress_bar_module.CappedProgressBar.format_meter(
+            100,
+            100,
+            elapsed=0.0,
+            finalized=False,
+            ncols=width,
+            desc="Syncing",
+            bar_format="{desc}  [{bar}] {percentage:.0f}%",
+        )
+        assert "99.9%" in meter
+        assert progress_bar_module.disp_len(meter) <= width
 
 
 def test_refresh_updates_display_without_changing_counters():

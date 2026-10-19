@@ -25,6 +25,7 @@ from multistorageclient.sync import progress_bar as progress_bar_module
 from multistorageclient.sync.monitors import ErrorMonitorThread, ResultMonitorThread
 from multistorageclient.sync.producer import ProducerThread
 from multistorageclient.sync.progress_bar import ProgressBar
+from multistorageclient.sync.transfer_progress import TransferActivity, TransferSnapshot
 from multistorageclient.sync.types import ErrorInfo, OperationType
 from multistorageclient.types import ObjectMetadata
 
@@ -66,6 +67,29 @@ def test_result_consumer_exits_with_stop_signal():
     result_consumer_thread.join(timeout=1)
 
     assert not result_consumer_thread.is_alive()
+
+
+def test_activity_snapshots_do_not_count_as_completed_files():
+    target_client = MockStorageClient()
+    result_queue = queue.Queue()
+    with ProgressBar("Syncing", True, total_items=100, show_transfer_progress=True) as progress:
+        result_queue.put(
+            (
+                OperationType.PROGRESS,
+                "worker",
+                TransferSnapshot(24, (TransferActivity("large.tar", time.monotonic()),)),
+            )
+        )
+        result_queue.put((OperationType.STOP, None, None))
+        monitor = ResultMonitorThread(cast(StorageClient, target_client), "", progress, result_queue)
+        monitor.run()
+        assert monitor.error is None
+        assert monitor.total_files_added == monitor.total_files_deleted == 0
+        assert monitor.total_bytes_added == monitor.total_bytes_deleted == 0
+        assert progress.pbar is not None
+        assert progress.pbar.n == 0
+        progress.refresh(force=True)
+        assert "in-flight: 24" in str(progress.pbar)
 
 
 def test_error_info_dataclass():

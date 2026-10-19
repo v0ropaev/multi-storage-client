@@ -109,7 +109,19 @@ def test_sync_manager_rejects_overlapping_paths_on_same_client(source_path: str,
         make_manager()
 
 
-def test_sync_objects_commits_metadata_by_default():
+@pytest.mark.parametrize(
+    "source_posix, target_posix, delete_unmatched, operation",
+    [
+        (False, True, False, "download"),
+        (True, False, False, "upload"),
+        (True, True, False, "copy"),
+        (False, False, False, "transfer"),
+        (False, True, True, "download"),
+        (True, False, True, "upload"),
+        (True, True, True, "copy"),
+    ],
+)
+def test_sync_objects_commits_metadata_by_default(source_posix, target_posix, delete_unmatched, operation):
     """Test that sync_objects calls commit_metadata when commit_metadata is True (default)."""
     source_client = MockStorageClient()
     target_client = MockStorageClient()
@@ -135,9 +147,22 @@ def test_sync_objects_commits_metadata_by_default():
         target_path="",
     )
 
-    with mock.patch.object(target_client, "commit_metadata") as mock_commit:
-        manager.sync_objects(num_worker_processes=1, commit_metadata=True)
+    with (
+        mock.patch.object(source_client, "_is_posix_file_storage_provider", return_value=source_posix),
+        mock.patch.object(target_client, "_is_posix_file_storage_provider", return_value=target_posix),
+        mock.patch.object(target_client, "commit_metadata") as mock_commit,
+        mock.patch.object(manager_module, "ProgressBar", wraps=progress_bar_module.ProgressBar) as progress_factory,
+    ):
+        manager.sync_objects(
+            num_worker_processes=1,
+            commit_metadata=True,
+            delete_unmatched_files=delete_unmatched,
+            description="Syncing dataset alpha",
+        )
         mock_commit.assert_called_once()
+        assert progress_factory.call_args.kwargs["transfer_operation"] == operation
+        assert progress_factory.call_args.kwargs["include_deletions"] is delete_unmatched
+        assert progress_factory.call_args.kwargs["desc"] == "Syncing dataset alpha"
 
 
 def test_sync_objects_skips_commit_when_commit_metadata_false():
@@ -236,7 +261,8 @@ def test_network_sampling_scope_and_cleanup(monkeypatch, tmp_path, capsys, netwo
         context.Event.return_value = shutdown
 
         def create_process(target, args):
-            leave_partial_file(args[-1])
+            assert args[-1] is True
+            leave_partial_file(args[-2])
             return processes[len(staging_dirs) - 1]
 
         context.Process.side_effect = create_process
@@ -322,7 +348,7 @@ def test_single_process_interrupt_preserves_active_staging(monkeypatch, tmp_path
     source.list_recursive.side_effect = lambda **kwargs: iter([item])
     target.list_recursive.side_effect = lambda **kwargs: iter(())
 
-    def download(remote_paths, local_paths, metadata):
+    def download(remote_paths, local_paths, metadata, transfer_callback=None):
         staged_files.extend(Path(path) for path in local_paths)
         for path in staged_files:
             path.write_bytes(b"data")
@@ -340,8 +366,8 @@ def test_single_process_interrupt_preserves_active_staging(monkeypatch, tmp_path
         return thread
 
     source.download_files.side_effect = download
-    target.upload_files.side_effect = lambda remote_paths, local_paths, attributes: uploaded.extend(
-        Path(path).read_bytes() for path in local_paths
+    target.upload_files.side_effect = lambda remote_paths, local_paths, attributes, transfer_callback=None: (
+        uploaded.extend(Path(path).read_bytes() for path in local_paths)
     )
     monkeypatch.setattr(worker_module.threading, "Thread", make_thread)
     manager = SyncManager(cast(StorageClient, source), "", cast(StorageClient, target), "")

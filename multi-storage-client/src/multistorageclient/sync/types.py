@@ -51,6 +51,7 @@ class OperationType(Enum):
     ADD = "add"
     DELETE = "delete"
     SYMLINK = "symlink"  # Recreate a symbolic link on the target.
+    PROGRESS = "progress"
     STOP = "stop"  # Signal to stop the thread.
 
 

@@ -24,7 +24,7 @@ import threading
 import time
 from abc import abstractmethod
 from collections.abc import Callable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_completed
 from enum import Enum
 from functools import partial
 from typing import IO, Any, ClassVar, NamedTuple, TypeVar, cast
@@ -47,8 +47,10 @@ from ..types import (
     SignerType,
     StorageProvider,
     SymlinkHandling,
+    TransferCallback,
 )
 from ..utils import (
+    _transfer_notification,
     create_attribute_filter_evaluator,
     extract_prefix_from_glob,
     glob,
@@ -1124,6 +1126,7 @@ class BaseStorageProvider(StorageProvider):
         local_paths: Sequence[str],
         metadata: Sequence[ObjectMetadata | None] | None = None,
         max_workers: int = 16,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
         """
         Download multiple remote objects to local paths.
@@ -1136,6 +1139,8 @@ class BaseStorageProvider(StorageProvider):
         :param local_paths: Local destination paths for each remote object.
         :param metadata: Optional per-object metadata used for multipart decisions.
         :param max_workers: Maximum number of concurrent download workers.
+        :param transfer_callback: Optional observer called with the original input index and "started", "completed",
+            or "failed" for each executing attempt. Calls may be concurrent; callback exceptions are logged.
         :raises ValueError: If path or metadata lengths differ, or if max_workers is less than 1.
         :raises BatchTransferError: If one or more item downloads fail.
         """
@@ -1155,9 +1160,11 @@ class BaseStorageProvider(StorageProvider):
 
         rust_client = getattr(self, "_rust_client", None)
         if rust_client is not None:
-            self._download_files_async(rust_client, remote_paths, local_paths, resolved_metadata, max_workers)
+            self._download_files_async(
+                rust_client, remote_paths, local_paths, resolved_metadata, max_workers, transfer_callback
+            )
         else:
-            self._download_files_threaded(remote_paths, local_paths, resolved_metadata, max_workers)
+            self._download_files_threaded(remote_paths, local_paths, resolved_metadata, max_workers, transfer_callback)
 
     def _resolve_download_metadata(
         self,
@@ -1194,10 +1201,15 @@ class BaseStorageProvider(StorageProvider):
         local_paths: Sequence[str],
         metadata: Sequence[ObjectMetadata],
         max_workers: int,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
+        def download(index: int, remote_path: str, local_path: str, item_metadata: ObjectMetadata) -> None:
+            with _transfer_notification(transfer_callback, index):
+                self.download_file(remote_path, local_path, item_metadata)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {
-                executor.submit(self.download_file, rp, lp, metadata[i]): i
+                executor.submit(download, i, rp, lp, metadata[i]): i
                 for i, (rp, lp) in enumerate(zip(remote_paths, local_paths))
             }
             failures: list[BatchTransferFailure] = []
@@ -1224,6 +1236,7 @@ class BaseStorageProvider(StorageProvider):
         local_paths: Sequence[str],
         metadata: Sequence[ObjectMetadata],
         max_workers: int,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
         if not self._metric_init_event.is_set():
             self._init_metrics()
@@ -1260,33 +1273,34 @@ class BaseStorageProvider(StorageProvider):
 
         semaphore = asyncio.Semaphore(max_workers)
 
-        async def _download_one(key: str, local_path: str, use_multipart: bool) -> None:
+        async def _download_one(index: int, key: str, local_path: str, use_multipart: bool) -> None:
             error_type: str | None = None
             data_size: int | None = None
             async with semaphore:
-                start_time = time.perf_counter()
-                try:
-                    if use_multipart:
-                        data_size = await rust_client.download_multipart_to_file(key, local_path)
-                    else:
-                        data_size = await rust_client.download(key, local_path)
-                except Exception as e:
-                    error_type = type(e).__name__
-                    if isinstance(e, RustRetryableError):
-                        raise RetryableError(str(e)) from e
-                    raise
-                finally:
-                    latency = time.perf_counter() - start_time
-                    self._dispatch_metrics(
-                        operation=BaseStorageProvider._Operation.READ,
-                        latency=latency,
-                        data_size=data_size,
-                        error_type=error_type,
-                    )
+                with _transfer_notification(transfer_callback, index):
+                    start_time = time.perf_counter()
+                    try:
+                        if use_multipart:
+                            data_size = await rust_client.download_multipart_to_file(key, local_path)
+                        else:
+                            data_size = await rust_client.download(key, local_path)
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        if isinstance(e, RustRetryableError):
+                            raise RetryableError(str(e)) from e
+                        raise
+                    finally:
+                        latency = time.perf_counter() - start_time
+                        self._dispatch_metrics(
+                            operation=BaseStorageProvider._Operation.READ,
+                            latency=latency,
+                            data_size=data_size,
+                            error_type=error_type,
+                        )
 
         async def _download_all() -> None:
             results = await asyncio.gather(
-                *[_download_one(item.key, item.local_path, item.use_multipart) for item in items],
+                *[_download_one(item.item_index, item.key, item.local_path, item.use_multipart) for item in items],
                 return_exceptions=True,
             )
             failures.extend(
@@ -1294,10 +1308,12 @@ class BaseStorageProvider(StorageProvider):
                     index=item.item_index,
                     source_path=item.remote_path,
                     destination_path=item.local_path,
-                    error=result,
+                    error=CancelledError("File transfer cancelled")
+                    if isinstance(result, asyncio.CancelledError)
+                    else result,
                 )
                 for result, item in zip(results, items)
-                if isinstance(result, Exception)
+                if isinstance(result, (Exception, asyncio.CancelledError))
             )
             if failures:
                 logger.error("download_files: %d/%d downloads failed", len(failures), len(remote_paths))
@@ -1311,6 +1327,7 @@ class BaseStorageProvider(StorageProvider):
         remote_paths: Sequence[str],
         attributes: Sequence[dict[str, Any] | None] | None = None,
         max_workers: int = 16,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
         """
         Upload multiple local files to remote object paths.
@@ -1323,6 +1340,8 @@ class BaseStorageProvider(StorageProvider):
         :param remote_paths: Remote destination object paths for each local file.
         :param attributes: Optional per-file attributes to attach on upload.
         :param max_workers: Maximum number of concurrent upload workers.
+        :param transfer_callback: Optional observer called with the original input index and "started", "completed",
+            or "failed" for each executing attempt. Calls may be concurrent; callback exceptions are logged.
         :return: None.
         :raises ValueError: If path or attributes lengths differ, or if max_workers is less than 1.
         :raises BatchTransferError: If one or more item uploads fail.
@@ -1342,9 +1361,9 @@ class BaseStorageProvider(StorageProvider):
         has_any_attributes = attributes is not None and any(a is not None for a in attributes)
         rust_client = getattr(self, "_rust_client", None)
         if rust_client is not None and not has_any_attributes:
-            self._upload_files_async(rust_client, local_paths, remote_paths, max_workers)
+            self._upload_files_async(rust_client, local_paths, remote_paths, max_workers, transfer_callback)
         else:
-            self._upload_files_threaded(local_paths, remote_paths, attributes, max_workers)
+            self._upload_files_threaded(local_paths, remote_paths, attributes, max_workers, transfer_callback)
 
     def _upload_files_threaded(
         self,
@@ -1352,10 +1371,15 @@ class BaseStorageProvider(StorageProvider):
         remote_paths: Sequence[str],
         attributes: Sequence[dict[str, Any] | None] | None = None,
         max_workers: int = 16,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
+        def upload(index: int, remote_path: str, local_path: str, item_attributes: dict[str, Any] | None) -> None:
+            with _transfer_notification(transfer_callback, index):
+                self.upload_file(remote_path, local_path, item_attributes)
+
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_index = {
-                executor.submit(self.upload_file, rp, lp, attributes[i] if attributes is not None else None): i
+                executor.submit(upload, i, rp, lp, attributes[i] if attributes is not None else None): i
                 for i, (lp, rp) in enumerate(zip(local_paths, remote_paths))
             }
             failures: list[BatchTransferFailure] = []
@@ -1376,7 +1400,12 @@ class BaseStorageProvider(StorageProvider):
                 raise BatchTransferError(failures)
 
     def _upload_files_async(
-        self, rust_client: Any, local_paths: Sequence[str], remote_paths: Sequence[str], max_workers: int
+        self,
+        rust_client: Any,
+        local_paths: Sequence[str],
+        remote_paths: Sequence[str],
+        max_workers: int,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
         if not self._metric_init_event.is_set():
             self._init_metrics()
@@ -1411,33 +1440,34 @@ class BaseStorageProvider(StorageProvider):
 
         semaphore = asyncio.Semaphore(max_workers)
 
-        async def _upload_one(local_path: str, key: str, use_multipart: bool) -> None:
+        async def _upload_one(index: int, local_path: str, key: str, use_multipart: bool) -> None:
             error_type: str | None = None
             data_size: int | None = None
             async with semaphore:
-                start_time = time.perf_counter()
-                try:
-                    if use_multipart:
-                        data_size = await rust_client.upload_multipart_from_file(local_path, key)
-                    else:
-                        data_size = await rust_client.upload(local_path, key)
-                except Exception as e:
-                    error_type = type(e).__name__
-                    if isinstance(e, RustRetryableError):
-                        raise RetryableError(str(e)) from e
-                    raise
-                finally:
-                    latency = time.perf_counter() - start_time
-                    self._dispatch_metrics(
-                        operation=BaseStorageProvider._Operation.WRITE,
-                        latency=latency,
-                        data_size=data_size,
-                        error_type=error_type,
-                    )
+                with _transfer_notification(transfer_callback, index):
+                    start_time = time.perf_counter()
+                    try:
+                        if use_multipart:
+                            data_size = await rust_client.upload_multipart_from_file(local_path, key)
+                        else:
+                            data_size = await rust_client.upload(local_path, key)
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        if isinstance(e, RustRetryableError):
+                            raise RetryableError(str(e)) from e
+                        raise
+                    finally:
+                        latency = time.perf_counter() - start_time
+                        self._dispatch_metrics(
+                            operation=BaseStorageProvider._Operation.WRITE,
+                            latency=latency,
+                            data_size=data_size,
+                            error_type=error_type,
+                        )
 
         async def _upload_all() -> None:
             results = await asyncio.gather(
-                *[_upload_one(item.local_path, item.key, item.use_multipart) for item in items],
+                *[_upload_one(item.item_index, item.local_path, item.key, item.use_multipart) for item in items],
                 return_exceptions=True,
             )
             failures.extend(
@@ -1445,10 +1475,12 @@ class BaseStorageProvider(StorageProvider):
                     index=item.item_index,
                     source_path=item.local_path,
                     destination_path=item.remote_path,
-                    error=result,
+                    error=CancelledError("File transfer cancelled")
+                    if isinstance(result, asyncio.CancelledError)
+                    else result,
                 )
                 for result, item in zip(results, items)
-                if isinstance(result, Exception)
+                if isinstance(result, (Exception, asyncio.CancelledError))
             )
             if failures:
                 logger.error("upload_files: %d/%d uploads failed", len(failures), len(local_paths))

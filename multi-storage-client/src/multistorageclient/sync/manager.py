@@ -213,11 +213,23 @@ class SyncManager:
             shutdown_event = SharedEvent()
 
         # Create a progress bar to track the progress of the sync operation.
+        source_is_posix = self.source_client._is_posix_file_storage_provider()
+        target_is_posix = self.target_client._is_posix_file_storage_provider()
+        transfer_operation = "transfer"
+        if source_is_posix and target_is_posix:
+            transfer_operation = "copy"
+        elif source_is_posix:
+            transfer_operation = "upload"
+        elif target_is_posix:
+            transfer_operation = "download"
         progress = ProgressBar(
             desc=description,
             show_progress=True,
             total_items=0,
             show_network_throughput=execution_mode == ExecutionMode.LOCAL,
+            show_transfer_progress=execution_mode == ExecutionMode.LOCAL,
+            transfer_operation=transfer_operation,
+            include_deletions=delete_unmatched_files,
         )
 
         # Start the producer thread to compare source and target file listings and queue sync operations.
@@ -281,6 +293,7 @@ class SyncManager:
                             result_queue,
                             error_queue,
                             shutdown_event,
+                            track_transfers=progress.pbar is not None,
                         )
                 else:
                     # Create individual processes using spawn context for fork-safety
@@ -299,6 +312,7 @@ class SyncManager:
                                 error_queue,
                                 shutdown_event,
                                 temp_dir.name,
+                                progress.pbar is not None,
                             ),
                         )
                         processes.append(process)
@@ -380,12 +394,14 @@ class SyncManager:
         error_monitor_thread.join()
 
         # Commit the metadata to the target storage client (if commit_metadata is True).
-        if commit_metadata:
-            self.target_client.commit_metadata()
-
-        # Log the completion of the sync operation.
-        progress.close()
-        logger.debug(f"Completed sync operation {description}")
+        progress.set_phase("finalizing metadata")
+        progress.refresh(force=True)
+        try:
+            if commit_metadata:
+                self.target_client.commit_metadata()
+        except BaseException:
+            progress.close()
+            raise
 
         # Collect all errors from various sources
         error_messages = []
@@ -420,6 +436,9 @@ class SyncManager:
             total_bytes_deleted=result_monitor_thread.total_bytes_deleted,
             total_time_seconds=time.time() - sync_start_time,
         )
+
+        progress.close(complete=not error_messages)
+        logger.debug(f"Completed sync operation {description}")
 
         if error_messages:
             raise SyncError(

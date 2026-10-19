@@ -31,8 +31,9 @@ from ..types import (
     SourceVersionCheckMode,
     SymlinkHandling,
     SyncResult,
+    TransferCallback,
 )
-from ..utils import PatternMatcher, join_paths
+from ..utils import PatternMatcher, _map_transfer_callback, join_paths
 from .single import SingleStorageClient
 from .types import AbstractStorageClient
 
@@ -251,11 +252,12 @@ class CompositeStorageClient(AbstractStorageClient):
         local_paths: Sequence[str],
         metadata: Sequence[ObjectMetadata | None] | None = None,
         max_workers: int = 16,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
         if len(remote_paths) != len(local_paths):
             raise ValueError("remote_paths and local_paths must have the same length")
 
-        groups: dict[str, tuple[list[str], list[str], list[ObjectMetadata | None]]] = {}
+        groups: dict[str, tuple[list[str], list[str], list[ObjectMetadata | None], list[int]]] = {}
         for i, (remote_path, local_path) in enumerate(zip(remote_paths, local_paths)):
             resolved = self._metadata_provider.realpath(remote_path)
             if not resolved.exists:
@@ -268,16 +270,25 @@ class CompositeStorageClient(AbstractStorageClient):
                     "Metadata provider must return ResolvedPath with profile set."
                 )
             if profile not in groups:
-                groups[profile] = ([], [], [])
+                groups[profile] = ([], [], [], [])
             groups[profile][0].append(resolved.physical_path)
             groups[profile][1].append(local_path)
             groups[profile][2].append(metadata[i] if metadata is not None else None)
+            groups[profile][3].append(i)
 
-        for profile, (physical_paths, group_local_paths, group_metadata) in groups.items():
+        for profile, (physical_paths, group_local_paths, group_metadata, indices) in groups.items():
             child = self._get_child_client(profile)
             has_any_metadata = any(m is not None for m in group_metadata)
             child.download_files(
-                physical_paths, group_local_paths, group_metadata if has_any_metadata else None, max_workers
+                physical_paths,
+                group_local_paths,
+                group_metadata if has_any_metadata else None,
+                max_workers,
+                **(
+                    {"transfer_callback": _map_transfer_callback(transfer_callback, indices)}
+                    if transfer_callback is not None
+                    else {}
+                ),
             )
 
     def glob(
@@ -388,6 +399,7 @@ class CompositeStorageClient(AbstractStorageClient):
         local_paths: Sequence[str],
         attributes: Sequence[dict[str, Any] | None] | None = None,
         max_workers: int = 16,
+        transfer_callback: TransferCallback | None = None,
     ) -> None:
         """Upload operations not supported in read-only mode."""
         raise NotImplementedError(

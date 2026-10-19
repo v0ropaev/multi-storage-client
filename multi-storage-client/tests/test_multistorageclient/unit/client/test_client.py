@@ -448,6 +448,31 @@ def test_single_download_files_rejects_mismatched_metadata_length_with_replica_m
         client.download_files(["/a"], ["/local_a"], metadata=[])
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_replica_batch_download_emits_file_lifecycle_events(single_backend_config, fail):
+    client = StorageClient(single_backend_config)
+    single = client._delegate
+    assert isinstance(single, SingleStorageClient)
+    single._metadata_provider = None
+    single._replica_manager = MagicMock()
+    events = []
+
+    def download(remote_path, local_path):
+        if fail and remote_path == "second":
+            raise PermissionError("failed")
+
+    def transfer_callback(index, event):
+        events.append((index, event))
+
+    single.download_file = MagicMock(side_effect=download)
+    if fail:
+        with pytest.raises(PermissionError):
+            client.download_files(["first", "second"], ["/first", "/second"], transfer_callback=transfer_callback)
+    else:
+        client.download_files(["first", "second"], ["/first", "/second"], transfer_callback=transfer_callback)
+    assert events == [(0, "started"), (0, "completed"), (1, "started"), (1, "failed" if fail else "completed")]
+
+
 def test_download_files_rejects_mismatched_lengths_composite(multi_backend_config):
     client = StorageClient(multi_backend_config)
     with pytest.raises(ValueError, match="same length"):
@@ -929,7 +954,18 @@ def test_upload_files_rejects_mismatched_attributes_length(single_backend_config
         client.upload_files(["/a", "/b"], ["/la", "/lb"], attributes=[{"k": "v"}])
 
 
-def test_composite_download_files_groups_by_profile(multi_backend_config):
+@pytest.mark.parametrize("notify", [False, True])
+def test_composite_download_files_groups_by_profile(multi_backend_config, notify):
+    events = []
+
+    def transfer_callback(index, event):
+        events.append((index, event))
+
+    def download(remote_paths, local_paths, metadata, max_workers, transfer_callback):
+        for index in range(len(remote_paths)):
+            transfer_callback(index, "started")
+            transfer_callback(index, "completed")
+
     client = StorageClient(multi_backend_config)
     composite = client._delegate
     assert isinstance(composite, CompositeStorageClient)
@@ -943,6 +979,9 @@ def test_composite_download_files_groups_by_profile(multi_backend_config):
 
     loc1_client = MagicMock()
     loc2_client = MagicMock()
+    if notify:
+        loc1_client.download_files.side_effect = download
+        loc2_client.download_files.side_effect = download
     composite._child_clients["loc1"] = loc1_client
     composite._child_clients["loc2"] = loc2_client
 
@@ -950,10 +989,21 @@ def test_composite_download_files_groups_by_profile(multi_backend_config):
         ["logical/a", "logical/b", "logical/c"],
         ["/la", "/lb", "/lc"],
         max_workers=4,
+        transfer_callback=transfer_callback if notify else None,
     )
 
-    loc1_client.download_files.assert_called_once_with(["phys/a", "phys/c"], ["/la", "/lc"], None, 4)
-    loc2_client.download_files.assert_called_once_with(["phys/b"], ["/lb"], None, 4)
+    loc1_client.download_files.assert_called_once_with(
+        ["phys/a", "phys/c"], ["/la", "/lc"], None, 4, **({"transfer_callback": ANY} if notify else {})
+    )
+    loc2_client.download_files.assert_called_once_with(
+        ["phys/b"], ["/lb"], None, 4, **({"transfer_callback": ANY} if notify else {})
+    )
+
+    assert events == (
+        [(0, "started"), (0, "completed"), (2, "started"), (2, "completed"), (1, "started"), (1, "completed")]
+        if notify
+        else []
+    )
 
 
 def test_composite_download_files_raises_on_missing_file(multi_backend_config):
